@@ -1,7 +1,6 @@
 #include "measurement_core.h"
 
 #include <math.h>
-
 #include <string.h>
 
 #include "debug_logging.h"
@@ -14,43 +13,202 @@
 #define MEASUREMENT_CORE_TOPOLOGY_SETTLE_DELAY_MS       20U
 #define MEASUREMENT_CORE_MANUAL_SWITCH_DELAY_MS       3000U
 
+/*
+ * ADC:n jänniteskaalan referenssi.
+ *
+ * Huom:
+ * Tämä EI ole Kelvin-haaran CC_REF, vaan ADC:n digitaalisen muunnoksen
+ * skaalausreferenssi.
+ */
 #define MEASUREMENT_CORE_ADC_REFERENCE_VOLTAGE_V         3.3f
-#define MEASUREMENT_CORE_LOW_RANGE_TOP_RESISTOR_OHMS     10000.0f
-#define MEASUREMENT_CORE_HIGH_RANGE_TOP_RESISTOR_OHMS   470000.0f
-#define MEASUREMENT_CORE_MIN_VALID_DIVIDER_VOLTAGE_V        0.001f
-#define MEASUREMENT_CORE_MAX_VALID_MARGIN_V                0.001f
-
-#define MEASUREMENT_CORE_DISCARD_SAMPLES                  2U
-#define MEASUREMENT_CORE_KEEP_SAMPLES                     8U
-
-#define MEASUREMENT_CORE_OPEN_MARGIN_V                   0.050f
 
 /*
- * Kelvinin väliaikainen kalibrointikerroin.
+ * ============================================================================
+ * VDIVS-haarojen vastusarvot nykyisen suunnitelman mukaisesti
+ * ============================================================================
+ *
+ * LOW:
+ *   820 Ω
+ *
+ * MID:
+ *   56 kΩ
+ *
+ * HIGH:
+ *   470 kΩ
+ *
+ * Huom:
+ * LOW-haara toimii myös diodimittauksessa etuvastuksena.
  */
-#define MEASUREMENT_CORE_KELVIN_OHMS_PER_VOLT             4.12f
-#define MEASUREMENT_CORE_KELVIN_MIN_VALID_VOLTAGE_V       0.010f
-#define MEASUREMENT_CORE_KELVIN_MAX_VALID_VOLTAGE_V       3.200f
-#define MEASUREMENT_CORE_KELVIN_LOW_CONFIDENCE_VOLTAGE_V  0.450f
+#define MEASUREMENT_CORE_LOW_RANGE_TOP_RESISTOR_OHMS       820.0f
+#define MEASUREMENT_CORE_MID_RANGE_TOP_RESISTOR_OHMS     56000.0f
+#define MEASUREMENT_CORE_HIGH_RANGE_TOP_RESISTOR_OHMS   470000.0f
+
+/*
+ * Yleiset jakajamallin validiteettirajat VDIVS-baselinelle.
+ */
+#define MEASUREMENT_CORE_MIN_VALID_DIVIDER_VOLTAGE_V        0.001f
+#define MEASUREMENT_CORE_MAX_VALID_MARGIN_V                 0.001f
+
+/*
+ * ADC-keskiarvoistus:
+ * - hylätään muutama alkuarvo
+ * - pidetään useampi näyte
+ */
+#define MEASUREMENT_CORE_DISCARD_SAMPLES                    2U
+#define MEASUREMENT_CORE_KEEP_SAMPLES                       8U
+
+/*
+ * Open-päätöksen alustava marginaali.
+ *
+ * Huom:
+ * Tätä heuristiikkaa hiotaan myöhemmin, mutta debug-runkona tämä on edelleen
+ * hyödyllinen.
+ */
+#define MEASUREMENT_CORE_OPEN_MARGIN_V                     0.050f
+
+/*
+ * ============================================================================
+ * Kelvin-mittauksen oikea mittausmalli
+ * ============================================================================
+ *
+ * Tässä protoversiossa Kelvin-haara EI ole tavallinen jännitejakaja.
+ *
+ * Sen sijaan vasemman puolen U1 + M1 + Rsense muodostavat transistoriohjatun
+ * virtalähdehaaran:
+ *
+ * - CC_REF = 1.0 V toimii ohjausreferenssinä
+ * - RREF1 = 47 Ω toimii virtareferenssivastuksena
+ * - DUT:n läpi kulkee noin vakio testivirta
+ *
+ * Nimellinen testivirta:
+ *
+ *   I_TEST_NOM ≈ CC_REF / RREF1
+ *              ≈ 1.0 V / 47 Ω
+ *              ≈ 21.28 mA
+ *
+ * Oikealla puolella oleva measurement amplifier mittaa sense+- ja sense--solmujen
+ * erotusjännitettä ja vahvistaa sen ennen ADC:tä.
+ *
+ * Kaavion ideaalinen vastusverkko:
+ *   R1 = 1 kΩ
+ *   R2 = 1 kΩ
+ *   R3 = 4.7 kΩ
+ *   R4 = 4.7 kΩ
+ *
+ * antaa ideaalisen ensimmäisen kertaluvun differentiaalivahvistuksen:
+ *
+ *   G_MEAS ≈ 4.7k / 1k ≈ 4.7
+ *
+ * Tällöin:
+ *
+ *   V_ADC ≈ G_MEAS * V_DUT
+ *   V_DUT = I_TEST_NOM * R_DUT
+ *
+ * jolloin:
+ *
+ *   R_DUT ≈ V_ADC / (G_MEAS * I_TEST_NOM)
+ *
+ * Huom:
+ * Tämä on edelleen prototason ensimmäisen kertaluvun malli. Lopulliseen
+ * tarkkuuteen vaikuttavat mm.
+ * - virtalähdehaaran todellinen virta vs. nimellisvirta
+ * - measurement amplifierin todellinen gain / offset
+ * - common-mode-alue ja headroom
+ * - johtimien / kytkimien resistanssit
+ * - komponenttitoleranssit
+ *
+ * Mutta tämä malli on selvästi oikeampi kuin aiempi versio, jossa
+ * measurement amplifierin gain jäi laskennasta pois ja Kelvin-arviot
+ * menivät liian suuriksi.
+ */
+#define MEASUREMENT_CORE_KELVIN_CC_REF_VOLTAGE_V           1.0f
+#define MEASUREMENT_CORE_KELVIN_RREF1_OHMS                47.0f
+#define MEASUREMENT_CORE_KELVIN_MEAS_GAIN_V_PER_V          4.7f
+
+/*
+ * Nimellinen Kelvin-testivirta.
+ */
+#define MEASUREMENT_CORE_KELVIN_NOMINAL_TEST_CURRENT_A \
+    (MEASUREMENT_CORE_KELVIN_CC_REF_VOLTAGE_V / MEASUREMENT_CORE_KELVIN_RREF1_OHMS)
+
+/*
+ * Kelvin-polun ideaalinen siirtokerroin:
+ *
+ *   V_ADC ≈ (G_MEAS * I_TEST_NOM) * R_DUT
+ *
+ * Tämä erotetaan omaksi makrokseen, jotta laskenta pysyy selkeänä
+ * eikä koodiin jää "taikanumeroita".
+ */
+#define MEASUREMENT_CORE_KELVIN_TRANSFER_V_PER_OHM \
+    (MEASUREMENT_CORE_KELVIN_MEAS_GAIN_V_PER_V * MEASUREMENT_CORE_KELVIN_NOMINAL_TEST_CURRENT_A)
+
+/*
+ * Mahdollinen Kelvin-offset ADC-ulostulossa.
+ *
+ * Tämä jätetään nyt nollaan, mutta on hyödyllinen myöhempää bench-kalibrointia
+ * varten, jos measurement amplifierissa tai koko signaaliketjussa havaitaan
+ * systemaattinen nollatasosiirtymä.
+ */
+#define MEASUREMENT_CORE_KELVIN_ADC_OFFSET_V               0.0f
+
+/*
+ * Kelvin-lukeman validiteettirajat.
+ *
+ * Tässä mallissa ADC mittaa measurement amplifierin ulostuloa.
+ *
+ * Ideaalisesti skaalakerroin on noin:
+ *
+ *   V_ADC ≈ 0.1 V / ohm
+ *
+ * jolloin karkea intuitio on:
+ *
+ *   0.01 V -> 0.1 Ω
+ *   0.02 V -> 0.2 Ω
+ *   0.10 V -> 1 Ω
+ *   1.00 V -> 10 Ω
+ *   2.00 V -> 20 Ω
+ *   3.00 V -> 30 Ω
+ *
+ * Siksi:
+ * - hyvin pieni jännitealue on offset-, johdinresistanssi- ja kohinadominoitu
+ * - lähellä ADC:n ylärajaa ollaan jo suuren vastuksen / amplifier headroomin
+ *   tai virtalähdehaaran compliance-rajan lähellä
+ */
+#define MEASUREMENT_CORE_KELVIN_MIN_VALID_VOLTAGE_V         0.001f
+#define MEASUREMENT_CORE_KELVIN_MAX_VALID_VOLTAGE_V         3.100f
+#define MEASUREMENT_CORE_KELVIN_LOW_CONFIDENCE_VOLTAGE_V    0.020f
+#define MEASUREMENT_CORE_KELVIN_NEAR_ADC_RAIL_MARGIN_V      0.100f
 
 /*
  * Open-slot hajakapasitanssi.
  */
-#define MEASUREMENT_CORE_CAP_OPEN_OFFSET_PF              25.75f
+#define MEASUREMENT_CORE_CAP_OPEN_OFFSET_PF                25.75f
 
 /*
  * Diodiproben kynnysarvot.
  *
- * Nämä on tuotu aiemmasta referenssirungosta samaa henkeä noudattaen,
- * mutta sidottu nykyiseen 3.3 V VDIVS-maailmaan.
+ * Nämä on pidetty saman hengen mukaisina kuin aiemmassa rungossa, mutta
+ * niitä kannattaa myöhemmin säätää uuden kolmialueisen VDIVS-verkon
+ * bench-testien perusteella.
+ *
+ * Malli perustuu tällä hetkellä:
+ * - forward vs reverse -polariteetin eroon
+ * - erityisesti LOW-haaran käyttäytymiseen
+ * - haarojen väliseen epälineaarisuuteen
  */
-#define MEASUREMENT_CORE_DIODE_MAX_CONDUCTION_V          2.8f
-#define MEASUREMENT_CORE_DIODE_RAIL_MARGIN_V             0.20f
-#define MEASUREMENT_CORE_DIODE_LOW_MARGIN_V              0.05f
-#define MEASUREMENT_CORE_DIODE_RESISTOR_SUM_MARGIN_V     0.20f
-#define MEASUREMENT_CORE_DIODE_NONLINEAR_MARGIN_V        0.05f
-#define MEASUREMENT_CORE_DIODE_LED_NODE_THRESHOLD_V      1.15f
-#define MEASUREMENT_CORE_DIODE_RATIO_EPSILON             0.001f
+#define MEASUREMENT_CORE_DIODE_MAX_CONDUCTION_V             2.8f
+#define MEASUREMENT_CORE_DIODE_RAIL_MARGIN_V                0.20f
+#define MEASUREMENT_CORE_DIODE_LOW_MARGIN_V                 0.05f
+#define MEASUREMENT_CORE_DIODE_RESISTOR_SUM_MARGIN_V        0.20f
+#define MEASUREMENT_CORE_DIODE_NONLINEAR_MARGIN_V           0.05f
+#define MEASUREMENT_CORE_DIODE_LED_NODE_THRESHOLD_V         1.15f
+#define MEASUREMENT_CORE_DIODE_RATIO_EPSILON                0.001f
+
+/*
+ * ============================================================================
+ * Sisäiset funktioprototyypit
+ * ============================================================================
+ */
 
 static float measurement_core_convert_raw_to_voltage(uint16_t raw_value);
 
@@ -71,6 +229,13 @@ static component_type_t measurement_core_classify_diode_probe(
 static float measurement_core_get_diode_conduction_voltage(
     const measurement_data_t *data);
 
+static float measurement_core_get_max3(float a, float b, float c);
+
+static float measurement_core_get_three_point_spread(
+    float v1,
+    float v2,
+    float v3);
+
 static HAL_StatusTypeDef measurement_core_apply_topology_and_log(
     measurement_topology_mode_t mode);
 
@@ -84,12 +249,19 @@ static HAL_StatusTypeDef measurement_core_read_kelvin_average(
 
 static HAL_StatusTypeDef measurement_core_measure_safe(measurement_data_t *data);
 static HAL_StatusTypeDef measurement_core_measure_res_high(measurement_data_t *data);
+static HAL_StatusTypeDef measurement_core_measure_res_mid(measurement_data_t *data);
 static HAL_StatusTypeDef measurement_core_measure_res_low(measurement_data_t *data);
 static HAL_StatusTypeDef measurement_core_measure_capacitance(measurement_data_t *data);
 static HAL_StatusTypeDef measurement_core_measure_diode_mode(
     measurement_topology_mode_t mode,
     const char *label,
     float *voltage_result);
+
+/*
+ * ============================================================================
+ * Perushelperit
+ * ============================================================================
+ */
 
 static float measurement_core_convert_raw_to_voltage(uint16_t raw_value)
 {
@@ -130,22 +302,32 @@ static bool measurement_core_estimate_resistance_from_kelvin_voltage(
     float kelvin_voltage,
     float *result_ohms)
 {
+    float corrected_voltage;
+
     if (result_ohms == NULL)
     {
         return false;
     }
 
-    if (kelvin_voltage < MEASUREMENT_CORE_KELVIN_MIN_VALID_VOLTAGE_V)
+    if (kelvin_voltage <= MEASUREMENT_CORE_KELVIN_MIN_VALID_VOLTAGE_V)
     {
         return false;
     }
 
-    if (kelvin_voltage > MEASUREMENT_CORE_KELVIN_MAX_VALID_VOLTAGE_V)
+    if (kelvin_voltage >= MEASUREMENT_CORE_KELVIN_MAX_VALID_VOLTAGE_V)
     {
         return false;
     }
 
-    *result_ohms = kelvin_voltage * MEASUREMENT_CORE_KELVIN_OHMS_PER_VOLT;
+    corrected_voltage = kelvin_voltage - MEASUREMENT_CORE_KELVIN_ADC_OFFSET_V;
+    if (corrected_voltage <= 0.0f)
+    {
+        return false;
+    }
+
+    *result_ohms =
+        corrected_voltage / MEASUREMENT_CORE_KELVIN_TRANSFER_V_PER_OHM;
+
     return true;
 }
 
@@ -168,13 +350,41 @@ static float measurement_core_apply_cap_open_offset(float raw_cap_pf)
     return corrected_pf;
 }
 
+static float measurement_core_get_max3(float a, float b, float c)
+{
+    float max_value = a;
+
+    if (b > max_value)
+    {
+        max_value = b;
+    }
+
+    if (c > max_value)
+    {
+        max_value = c;
+    }
+
+    return max_value;
+}
+
+static float measurement_core_get_three_point_spread(
+    float v1,
+    float v2,
+    float v3)
+{
+    const float d12 = fabsf(v1 - v2);
+    const float d23 = fabsf(v2 - v3);
+    const float d13 = fabsf(v1 - v3);
+
+    return measurement_core_get_max3(d12, d23, d13);
+}
+
 /*
- * Valitsee diode-proben "johtavan suunnan" jännitteen.
- *
- * Tämä on sama idea kuin referenssissä:
- * pyritään palauttamaan se jännite, joka näyttää varsinaisen
- * conduction-signaturen mittaustopologiassa.
+ * ============================================================================
+ * Diodiproben helperit
+ * ============================================================================
  */
+
 static float measurement_core_get_diode_conduction_voltage(
     const measurement_data_t *data)
 {
@@ -224,19 +434,6 @@ static float measurement_core_get_diode_conduction_voltage(
     return (vf < vr) ? vf : vr;
 }
 
-/*
- * Luokittelee diode-proben tuloksen samaa henkeä seuraten kuin aiemmassa
- * referenssissä:
- * - OPEN
- * - DIODE
- * - LED
- * - RESISTOR
- * - UNKNOWN
- *
- * Huom:
- * Tämä on diode-proben oma luokitus, ei vielä koko järjestelmän lopullinen
- * komponenttipäätös.
- */
 static component_type_t measurement_core_classify_diode_probe(
     const measurement_data_t *data)
 {
@@ -272,7 +469,7 @@ static component_type_t measurement_core_classify_diode_probe(
 
     resistor_like =
         (fabsf((vf + vr) - MEASUREMENT_CORE_ADC_REFERENCE_VOLTAGE_V) <
-            MEASUREMENT_CORE_DIODE_RESISTOR_SUM_MARGIN_V);
+         MEASUREMENT_CORE_DIODE_RESISTOR_SUM_MARGIN_V);
 
     one_way_fwd =
         (vf < MEASUREMENT_CORE_DIODE_MAX_CONDUCTION_V) &&
@@ -297,13 +494,12 @@ static component_type_t measurement_core_classify_diode_probe(
         (data->diode_nonlinearity_forward_v > MEASUREMENT_CORE_DIODE_NONLINEAR_MARGIN_V) ||
         (data->diode_nonlinearity_reverse_v > MEASUREMENT_CORE_DIODE_NONLINEAR_MARGIN_V);
 
-    /*
-     * Referenssirungon open-tyylinen signature nykyisessä topologiassa:
-     * forward näyttää railin lähelle ja reverse näyttää lähelle GND:tä.
-     *
-     * Jos bench osoittaa myöhemmin eri käyttäytymisen, tätä voi hienosäätää.
-     */
     if (open_like_fwd && low_like_rev)
+    {
+        return COMPONENT_OPEN;
+    }
+
+    if (open_like_rev && low_like_fwd)
     {
         return COMPONENT_OPEN;
     }
@@ -341,6 +537,12 @@ static component_type_t measurement_core_classify_diode_probe(
 
     return COMPONENT_UNKNOWN;
 }
+
+/*
+ * ============================================================================
+ * Topologian vaihto + ADC-helperit
+ * ============================================================================
+ */
 
 static HAL_StatusTypeDef measurement_core_apply_topology_and_log(
     measurement_topology_mode_t mode)
@@ -422,6 +624,12 @@ static HAL_StatusTypeDef measurement_core_read_kelvin_average(
     *voltage_value = measurement_core_convert_raw_to_voltage(*raw_value);
     return HAL_OK;
 }
+
+/*
+ * ============================================================================
+ * Yksittäiset mittausvaiheet
+ * ============================================================================
+ */
 
 static HAL_StatusTypeDef measurement_core_measure_safe(measurement_data_t *data)
 {
@@ -516,6 +724,63 @@ static HAL_StatusTypeDef measurement_core_measure_res_high(measurement_data_t *d
     return HAL_OK;
 }
 
+static HAL_StatusTypeDef measurement_core_measure_res_mid(measurement_data_t *data)
+{
+    HAL_StatusTypeDef status;
+
+    if (data == NULL)
+    {
+        return HAL_ERROR;
+    }
+
+    status = measurement_core_apply_topology_and_log(
+        MEASUREMENT_TOPOLOGY_RESISTANCE_MID_RANGE);
+    if (status != HAL_OK)
+    {
+        return status;
+    }
+
+    LOG_INFO(MEASUREMENT_CORE_LOG_TAG, "WAIT Set switches for RES_MID");
+    HAL_Delay(MEASUREMENT_CORE_MANUAL_SWITCH_DELAY_MS);
+    HAL_Delay(MEASUREMENT_CORE_TOPOLOGY_SETTLE_DELAY_MS);
+
+    status = measurement_core_read_vdivs_average(
+        &data->res_mid_vdivs_adc_raw,
+        &data->res_mid_voltage_v);
+
+    if (status != HAL_OK)
+    {
+        LOG_ERROR(MEASUREMENT_CORE_LOG_TAG, "RES_MID VDIVS read FAILED");
+        return status;
+    }
+
+    data->res_mid_resistance_valid =
+        measurement_core_estimate_resistance_from_divider(
+            data->res_mid_voltage_v,
+            MEASUREMENT_CORE_MID_RANGE_TOP_RESISTOR_OHMS,
+            &data->res_mid_estimated_resistance_ohms);
+
+    if (data->res_mid_resistance_valid)
+    {
+        LOG_DEBUG(
+            MEASUREMENT_CORE_LOG_TAG,
+            "RES_MID: raw=%u V=%.4f R=%.1f ohm",
+            data->res_mid_vdivs_adc_raw,
+            (double)data->res_mid_voltage_v,
+            (double)data->res_mid_estimated_resistance_ohms);
+    }
+    else
+    {
+        LOG_DEBUG(
+            MEASUREMENT_CORE_LOG_TAG,
+            "RES_MID: raw=%u V=%.4f R=N/A",
+            data->res_mid_vdivs_adc_raw,
+            (double)data->res_mid_voltage_v);
+    }
+
+    return HAL_OK;
+}
+
 static HAL_StatusTypeDef measurement_core_measure_res_low(measurement_data_t *data)
 {
     HAL_StatusTypeDef status;
@@ -590,12 +855,6 @@ static HAL_StatusTypeDef measurement_core_measure_capacitance(measurement_data_t
         return status;
     }
 
-    /*
-     * Kapasitanssimoodissa:
-     * - K1 = vasen
-     * - K2 = ei merkitystä
-     * - DUT1 = LOW
-     */
     LOG_INFO(MEASUREMENT_CORE_LOG_TAG, "WAIT Set switches for CAPACITANCE");
     HAL_Delay(MEASUREMENT_CORE_MANUAL_SWITCH_DELAY_MS);
     HAL_Delay(MEASUREMENT_CORE_TOPOLOGY_SETTLE_DELAY_MS);
@@ -643,12 +902,6 @@ static HAL_StatusTypeDef measurement_core_measure_capacitance(measurement_data_t
     return HAL_OK;
 }
 
-/*
- * Yksi diode-mittausmoodi:
- * - topologia asetetaan
- * - odotetaan asettumista
- * - luetaan VDIVS
- */
 static HAL_StatusTypeDef measurement_core_measure_diode_mode(
     measurement_topology_mode_t mode,
     const char *label,
@@ -699,6 +952,7 @@ HAL_StatusTypeDef measurement_core_run_resistor_baseline(measurement_data_t *dat
     memset(data, 0, sizeof(*data));
 
     data->res_high_estimated_resistance_ohms = -1.0f;
+    data->res_mid_estimated_resistance_ohms = -1.0f;
     data->res_low_estimated_resistance_ohms = -1.0f;
     data->kelvin_estimated_resistance_ohms = -1.0f;
     data->cap_raw_pf = -1.0f;
@@ -706,13 +960,16 @@ HAL_StatusTypeDef measurement_core_run_resistor_baseline(measurement_data_t *dat
     data->cap_frequency_hz = -1.0f;
 
     data->diode_forward_low_voltage_v = -1.0f;
+    data->diode_forward_mid_voltage_v = -1.0f;
     data->diode_forward_high_voltage_v = -1.0f;
     data->diode_reverse_low_voltage_v = -1.0f;
+    data->diode_reverse_mid_voltage_v = -1.0f;
     data->diode_reverse_high_voltage_v = -1.0f;
     data->diode_nonlinearity_forward_v = -1.0f;
     data->diode_nonlinearity_reverse_v = -1.0f;
     data->diode_asymmetry_ratio = -1.0f;
     data->diode_probe_type = COMPONENT_UNKNOWN;
+    data->diode_valid = false;
 
     status = measurement_core_measure_safe(data);
     if (status != HAL_OK)
@@ -721,6 +978,20 @@ HAL_StatusTypeDef measurement_core_run_resistor_baseline(measurement_data_t *dat
     }
 
     status = measurement_core_measure_res_high(data);
+    if (status != HAL_OK)
+    {
+        return status;
+    }
+
+    status = measurement_core_apply_topology_and_log(MEASUREMENT_TOPOLOGY_SAFE);
+    if (status != HAL_OK)
+    {
+        return status;
+    }
+
+    HAL_Delay(MEASUREMENT_CORE_TOPOLOGY_SETTLE_DELAY_MS);
+
+    status = measurement_core_measure_res_mid(data);
     if (status != HAL_OK)
     {
         return status;
@@ -752,6 +1023,7 @@ HAL_StatusTypeDef measurement_core_run_resistor_baseline(measurement_data_t *dat
         MEASUREMENT_CORE_LOG_TAG,
         "SUMMARY SAFE(raw=%u,V=%.4f) "
         "RES_HIGH(raw=%u,V=%.4f,R=%.1f) "
+        "RES_MID(raw=%u,V=%.4f,R=%.1f) "
         "RES_LOW(raw=%u,V=%.4f,R=%.1f)",
         data->safe_vdivs_adc_raw,
         (double)data->safe_voltage_v,
@@ -759,6 +1031,10 @@ HAL_StatusTypeDef measurement_core_run_resistor_baseline(measurement_data_t *dat
         (double)data->res_high_voltage_v,
         (double)(data->res_high_resistance_valid ?
             data->res_high_estimated_resistance_ohms : -1.0f),
+        data->res_mid_vdivs_adc_raw,
+        (double)data->res_mid_voltage_v,
+        (double)(data->res_mid_resistance_valid ?
+            data->res_mid_estimated_resistance_ohms : -1.0f),
         data->res_low_vdivs_adc_raw,
         (double)data->res_low_voltage_v,
         (double)(data->res_low_resistance_valid ?
@@ -805,18 +1081,19 @@ HAL_StatusTypeDef measurement_core_run_kelvin_probe(measurement_data_t *data)
 
     data->kelvin_valid = true;
 
-    if (data->kelvin_voltage_v >= MEASUREMENT_CORE_KELVIN_MAX_VALID_VOLTAGE_V)
+    if (data->kelvin_voltage_v >=
+        (MEASUREMENT_CORE_ADC_REFERENCE_VOLTAGE_V - MEASUREMENT_CORE_KELVIN_NEAR_ADC_RAIL_MARGIN_V))
     {
         LOG_WARN(
             MEASUREMENT_CORE_LOG_TAG,
-            "KELVIN near rail / possible saturation or out-of-range DUT");
+            "KELVIN near ADC rail / possible amplifier saturation, compliance limit or out-of-range DUT");
     }
 
     if (data->kelvin_voltage_v < MEASUREMENT_CORE_KELVIN_LOW_CONFIDENCE_VOLTAGE_V)
     {
         LOG_WARN(
             MEASUREMENT_CORE_LOG_TAG,
-            "KELVIN low-level / possible offset-dominated region");
+            "KELVIN very low-level / possible near-short, lead resistance or offset-dominated region");
     }
 
     data->kelvin_resistance_valid =
@@ -828,18 +1105,26 @@ HAL_StatusTypeDef measurement_core_run_kelvin_probe(measurement_data_t *data)
     {
         LOG_INFO(
             MEASUREMENT_CORE_LOG_TAG,
-            "KELVIN: raw=%u V=%.5f R_est=%.3f ohm",
+            "KELVIN: raw=%u Vadc=%.5f G=%.2f I_nom=%.5f A CC_REF=%.3fV RREF1=%.1f ohm R_est=%.3f ohm",
             data->kelvin_adc_raw,
             (double)data->kelvin_voltage_v,
+            (double)MEASUREMENT_CORE_KELVIN_MEAS_GAIN_V_PER_V,
+            (double)MEASUREMENT_CORE_KELVIN_NOMINAL_TEST_CURRENT_A,
+            (double)MEASUREMENT_CORE_KELVIN_CC_REF_VOLTAGE_V,
+            (double)MEASUREMENT_CORE_KELVIN_RREF1_OHMS,
             (double)data->kelvin_estimated_resistance_ohms);
     }
     else
     {
         LOG_INFO(
             MEASUREMENT_CORE_LOG_TAG,
-            "KELVIN: raw=%u V=%.5f R_est=N/A",
+            "KELVIN: raw=%u Vadc=%.5f G=%.2f I_nom=%.5f A CC_REF=%.3fV RREF1=%.1f ohm R_est=N/A",
             data->kelvin_adc_raw,
-            (double)data->kelvin_voltage_v);
+            (double)data->kelvin_voltage_v,
+            (double)MEASUREMENT_CORE_KELVIN_MEAS_GAIN_V_PER_V,
+            (double)MEASUREMENT_CORE_KELVIN_NOMINAL_TEST_CURRENT_A,
+            (double)MEASUREMENT_CORE_KELVIN_CC_REF_VOLTAGE_V,
+            (double)MEASUREMENT_CORE_KELVIN_RREF1_OHMS);
     }
 
     status = measurement_core_apply_topology_and_log(MEASUREMENT_TOPOLOGY_SAFE);
@@ -879,19 +1164,11 @@ HAL_StatusTypeDef measurement_core_run_diode_probe(measurement_data_t *data)
         return HAL_ERROR;
     }
 
-    /*
-     * Diodiproben rakenne:
-     * - DUT2 reititetään VDIVS-haaraan
-     * - diode direction -pinni vaihtaa suuntaa
-     * - DUT1 pidetään tässä vaiheessa LOW-tilassa
-     *
-     * Kytkinmuistilista käyttäjälle:
-     * - K1 = oikea
-     * - K2 = vasen
-     */
     data->diode_forward_low_voltage_v = -1.0f;
+    data->diode_forward_mid_voltage_v = -1.0f;
     data->diode_forward_high_voltage_v = -1.0f;
     data->diode_reverse_low_voltage_v = -1.0f;
+    data->diode_reverse_mid_voltage_v = -1.0f;
     data->diode_reverse_high_voltage_v = -1.0f;
     data->diode_nonlinearity_forward_v = -1.0f;
     data->diode_nonlinearity_reverse_v = -1.0f;
@@ -906,6 +1183,16 @@ HAL_StatusTypeDef measurement_core_run_diode_probe(measurement_data_t *data)
         MEASUREMENT_TOPOLOGY_DIODE_FORWARD_LOW_RANGE,
         "DIODE FWD LOW",
         &data->diode_forward_low_voltage_v);
+    if (status != HAL_OK)
+    {
+        (void)measurement_core_apply_topology_and_log(MEASUREMENT_TOPOLOGY_SAFE);
+        return status;
+    }
+
+    status = measurement_core_measure_diode_mode(
+        MEASUREMENT_TOPOLOGY_DIODE_FORWARD_MID_RANGE,
+        "DIODE FWD MID",
+        &data->diode_forward_mid_voltage_v);
     if (status != HAL_OK)
     {
         (void)measurement_core_apply_topology_and_log(MEASUREMENT_TOPOLOGY_SAFE);
@@ -933,6 +1220,16 @@ HAL_StatusTypeDef measurement_core_run_diode_probe(measurement_data_t *data)
     }
 
     status = measurement_core_measure_diode_mode(
+        MEASUREMENT_TOPOLOGY_DIODE_REVERSE_MID_RANGE,
+        "DIODE REV MID",
+        &data->diode_reverse_mid_voltage_v);
+    if (status != HAL_OK)
+    {
+        (void)measurement_core_apply_topology_and_log(MEASUREMENT_TOPOLOGY_SAFE);
+        return status;
+    }
+
+    status = measurement_core_measure_diode_mode(
         MEASUREMENT_TOPOLOGY_DIODE_REVERSE_HIGH_RANGE,
         "DIODE REV HIGH",
         &data->diode_reverse_high_voltage_v);
@@ -943,10 +1240,16 @@ HAL_StatusTypeDef measurement_core_run_diode_probe(measurement_data_t *data)
     }
 
     data->diode_nonlinearity_forward_v =
-        fabsf(data->diode_forward_low_voltage_v - data->diode_forward_high_voltage_v);
+        measurement_core_get_three_point_spread(
+            data->diode_forward_low_voltage_v,
+            data->diode_forward_mid_voltage_v,
+            data->diode_forward_high_voltage_v);
 
     data->diode_nonlinearity_reverse_v =
-        fabsf(data->diode_reverse_low_voltage_v - data->diode_reverse_high_voltage_v);
+        measurement_core_get_three_point_spread(
+            data->diode_reverse_low_voltage_v,
+            data->diode_reverse_mid_voltage_v,
+            data->diode_reverse_high_voltage_v);
 
     data->diode_asymmetry_ratio =
         data->diode_nonlinearity_reverse_v /
@@ -958,11 +1261,14 @@ HAL_StatusTypeDef measurement_core_run_diode_probe(measurement_data_t *data)
     LOG_INFO(
         MEASUREMENT_CORE_LOG_TAG,
         "DIODE SUMMARY "
-        "FWD_LOW=%.4f FWD_HIGH=%.4f REV_LOW=%.4f REV_HIGH=%.4f "
+        "FWD_LOW=%.4f FWD_MID=%.4f FWD_HIGH=%.4f "
+        "REV_LOW=%.4f REV_MID=%.4f REV_HIGH=%.4f "
         "dF=%.4f dR=%.4f ratio=%.3f type=%s",
         (double)data->diode_forward_low_voltage_v,
+        (double)data->diode_forward_mid_voltage_v,
         (double)data->diode_forward_high_voltage_v,
         (double)data->diode_reverse_low_voltage_v,
+        (double)data->diode_reverse_mid_voltage_v,
         (double)data->diode_reverse_high_voltage_v,
         (double)data->diode_nonlinearity_forward_v,
         (double)data->diode_nonlinearity_reverse_v,
@@ -985,19 +1291,28 @@ component_type_t measurement_core_detect_component(const measurement_data_t *dat
      * Huom:
      * Tämä on edelleen kevyt väliaikainen detektio, eikä se käytä vielä
      * Kelvin-, cap- tai diode-proben lopullista päätöslogiikkaa.
+     *
+     * Nykyinen baseline-päätös:
+     * - jos mikä tahansa haaroista antaa validin resistanssiestimaatin,
+     *   palautetaan RESISTOR
+     * - jos kaikki haarat näyttävät railin lähelle, palautetaan OPEN
+     * - muuten UNKNOWN
      */
-
     if (data == NULL)
     {
         return COMPONENT_UNKNOWN;
     }
 
-    if (data->res_low_resistance_valid || data->res_high_resistance_valid)
+    if (data->res_low_resistance_valid ||
+        data->res_mid_resistance_valid ||
+        data->res_high_resistance_valid)
     {
         return COMPONENT_RESISTOR;
     }
 
     if ((data->res_high_voltage_v >=
+            (MEASUREMENT_CORE_ADC_REFERENCE_VOLTAGE_V - MEASUREMENT_CORE_OPEN_MARGIN_V)) &&
+        (data->res_mid_voltage_v >=
             (MEASUREMENT_CORE_ADC_REFERENCE_VOLTAGE_V - MEASUREMENT_CORE_OPEN_MARGIN_V)) &&
         (data->res_low_voltage_v >=
             (MEASUREMENT_CORE_ADC_REFERENCE_VOLTAGE_V - MEASUREMENT_CORE_OPEN_MARGIN_V)))

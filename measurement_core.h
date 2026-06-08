@@ -31,16 +31,26 @@ typedef enum
  * Yhden mittausajon tulokset.
  *
  * Tässä vaiheessa mukana on:
- * - resistiivisen VDIVS-polun baseline-data
+ * - resistiivisen VDIVS-polun baseline-data kaikilta kolmelta haaralta
+ *   (LOW / MID / HIGH)
  * - erillinen Kelvin-proben raakadata + alustava ohmiestimaatti
  * - erillinen kapasitanssiprobe TIM2:lla
- * - erillinen diode-probe VDIVS + diode direction -mallilla
+ * - erillinen diode-probe VDIVS + DUT1_CTRL -mallilla
  *
  * Huom:
  * - Kelvin ei vielä osallistu lopulliseen komponenttitunnistukseen
  * - capacitance ei vielä osallistu lopulliseen komponenttitunnistukseen
  * - diode_probe_type on diode-proben oma luokitus, ei vielä koko järjestelmän
  *   lopullinen komponenttipäätös
+ *
+ * Baseline:
+ * - HIGH = 470 kΩ
+ * - MID  = 56 kΩ
+ * - LOW  = 820 Ω
+ *
+ * Diodiprobe:
+ * - forward / reverse ovat korkean tason mittaussuuntia
+ * - niiden fyysinen toteutus tapahtuu DUT1_CTRL-pinnillä topologiakerroksessa
  */
 typedef struct
 {
@@ -49,6 +59,7 @@ typedef struct
      */
     uint16_t safe_vdivs_adc_raw;
     uint16_t res_high_vdivs_adc_raw;
+    uint16_t res_mid_vdivs_adc_raw;
     uint16_t res_low_vdivs_adc_raw;
 
     /*
@@ -67,6 +78,7 @@ typedef struct
      */
     float safe_voltage_v;
     float res_high_voltage_v;
+    float res_mid_voltage_v;
     float res_low_voltage_v;
     float kelvin_voltage_v;
 
@@ -78,9 +90,14 @@ typedef struct
     float cap_corrected_pf;
 
     /*
-     * Resistanssiarviot.
+     * Resistanssiarviot baseline-haaroista.
+     *
+     * Nämä ovat kukin oman haaransa jakosuhteesta laskettuja arvioita.
+     * Kaikki eivät välttämättä ole samalle DUT:lle validit, mikä itsessään
+     * on hyödyllistä debug- ja tunnistusvaiheessa.
      */
     float res_high_estimated_resistance_ohms;
+    float res_mid_estimated_resistance_ohms;
     float res_low_estimated_resistance_ohms;
     float kelvin_estimated_resistance_ohms;
 
@@ -88,30 +105,38 @@ typedef struct
      * Diodiproben raakajännitteet.
      *
      * forward_low:
-     *   diode direction = FORWARD, low-range source aktiivinen
+     *   forward-suunta, LOW-haara aktiivinen
+     *
+     * forward_mid:
+     *   forward-suunta, MID-haara aktiivinen
      *
      * forward_high:
-     *   diode direction = FORWARD, high-range source aktiivinen
+     *   forward-suunta, HIGH-haara aktiivinen
      *
      * reverse_low:
-     *   diode direction = REVERSE, low-range source aktiivinen
+     *   reverse-suunta, LOW-haara aktiivinen
+     *
+     * reverse_mid:
+     *   reverse-suunta, MID-haara aktiivinen
      *
      * reverse_high:
-     *   diode direction = REVERSE, high-range source aktiivinen
+     *   reverse-suunta, HIGH-haara aktiivinen
      */
     float diode_forward_low_voltage_v;
+    float diode_forward_mid_voltage_v;
     float diode_forward_high_voltage_v;
     float diode_reverse_low_voltage_v;
+    float diode_reverse_mid_voltage_v;
     float diode_reverse_high_voltage_v;
 
     /*
      * Diodiproben johdetut suureet.
      *
      * nonlinearity_forward_v:
-     *   |forward_low - forward_high|
+     *   kuvaa forward-suunnan haarariippuvaa epälineaarisuutta
      *
      * nonlinearity_reverse_v:
-     *   |reverse_low - reverse_high|
+     *   kuvaa reverse-suunnan haarariippuvaa epälineaarisuutta
      *
      * asymmetry_ratio:
      *   reverse / forward epälineaarisuuden suhde; debugia varten
@@ -124,6 +149,7 @@ typedef struct
      * Validiteetit.
      */
     bool res_high_resistance_valid;
+    bool res_mid_resistance_valid;
     bool res_low_resistance_valid;
 
     bool kelvin_valid;
@@ -141,7 +167,12 @@ typedef struct
 /*
  * Ajaa nykyisen resistiivisen baseline-mittauksen:
  *
- * SAFE -> RES_HIGH -> SAFE -> RES_LOW -> SAFE -> SUMMARY
+ * SAFE -> RES_HIGH -> SAFE -> RES_MID -> SAFE -> RES_LOW -> SAFE -> SUMMARY
+ *
+ * Tarkoitus:
+ * - saada kolmesta eri VDIVS-haarasta vertailukelpoinen baseline-data
+ * - parantaa erotuskykyä eri resistanssialueilla
+ * - auttaa myöhempää komponenttitunnistusta
  */
 HAL_StatusTypeDef measurement_core_run_resistor_baseline(measurement_data_t *data);
 
@@ -163,8 +194,10 @@ HAL_StatusTypeDef measurement_core_run_capacitance_probe(measurement_data_t *dat
  * Ajaa erillisen diode-proben:
  *
  * FORWARD_LOW  -> read
+ * FORWARD_MID  -> read
  * FORWARD_HIGH -> read
  * REVERSE_LOW  -> read
+ * REVERSE_MID  -> read
  * REVERSE_HIGH -> read
  * SAFE
  *

@@ -37,8 +37,10 @@
  *
  * Nämä kannattaa myöhemmin säätää todellisten mitattujen vastusten mukaan.
  */
-#define MEASUREMENT_CAP_R1_OHMS                  9973.0f
-#define MEASUREMENT_CAP_R2_OHMS                 99092.5f
+
+#define MEASUREMENT_CAP_R1_OHMS               1000000.0f
+#define MEASUREMENT_CAP_R2_OHMS                100000.0f
+
 #define MEASUREMENT_CAP_CAL_FACTOR                  1.0f
 
 /*

@@ -1,18 +1,134 @@
-
 #include "measurement_adc.h"
 #include "board_adc_hal.h"
 
+/*
+ * ============================================================================
+ * ADC-mittauskerroksen toteutus
+ * ============================================================================
+ *
+ * Tämän tiedoston vastuu on tarkoituksella rajattu:
+ *
+ * - valita oikea ADC-kanava (VDIVS tai KELVIN)
+ * - lukea yksi näyte tai usean näytteen keskiarvo
+ * - tarjota raakakoodin -> jännite -muunnos
+ *
+ * Tämä tiedosto EI:
+ * - päätä mikä VDIVS-haara on aktiivinen
+ * - ohjaa DUT1-tilaa
+ * - ohjaa releitä / K1 / K2 -reititystä
+ *
+ * Nämä korkeamman tason päätökset kuuluvat topologia- ja measurement_core-
+ * kerroksille.
+ *
+ * Projektin aktiiviset ADC-tulot:
+ *
+ *   VDIVS  -> PA7 -> ADC1_IN12
+ *   KELVIN -> PB0 -> ADC1_IN15
+ *
+ *Tässä tulee **`measurement_adc.c` kokonaan uudestaan** kattavasti kommentoituna ja nykyiseen malliin sovitettuna.
+
+Tämä versio on linjassa sen kanssa, että:
+
+- **VDIVS-solmu** luetaan kanavasta  
+  **PA7 -> ADC1_IN12**
+- **KELVIN-solmu** luetaan kanavasta  
+  **PB0 -> ADC1_IN15**
+- **ADC-kerros ei ohjaa topologiaa**, vaan:
+  - topologiakerros valitsee sähköisen reitin
+  - ADC-kerros vain lukee valitun analogiasolmun
+
+Kommentit on pidetty samalla tasolla kuin muissakin tiedostoissa.
+
+---
+
+## `measurement_adc.c`
+
+```c
+#include "measurement_adc.h"
+#include "board_adc_hal.h"
+
+/*
+ * ============================================================================
+ * ADC-mittauskerroksen yleiset asetukset
+ * ============================================================================
+ *
+ * Tämä tiedosto rakentaa board_adc_hal-kerroksen päälle yksinkertaisen
+ * mittausrajapinnan:
+ *
+ * - yhden näytteen luku valitulta mittaussolmulta
+ * - usean näytteen keskiarvoluku kohinan pienentämiseksi
+ * - raakakoodin muunto jännitteeksi
+ *
+ * Tämän kerroksen tarkoitus on erottaa:
+ *
+ *   1) board_adc_hal:
+ *      - ADC1:n fyysinen/perifeerinen alustus
+ *      - GPIO-pinnit analog-tilaan
+ *
+ *   2) measurement_adc:
+ *      - mitä ADC-tuloa kulloinkin luetaan
+ *      - miten näytteet otetaan
+ *      - miten tulos palautetaan ylemmälle mittauslogiikalle
+ *
+ * Tämä jako pitää mittauslogiikan siistinä:
+ * measurement_core ei tarvitse tietää HAL/ADC-konfiguraation yksityiskohtia.
+ */
 
 #define MEASUREMENT_ADC_TIMEOUT_MS      10U
 #define MEASUREMENT_ADC_MAX_RAW_12BIT   4095.0f
 
+/*
+ * Sisäinen helperi aktiivisen ADC-kanavan valintaan.
+ *
+ * Tämä ei ole julkinen API, koska ylemmän kerroksen ei tarvitse tietää
+ * käytettyjä kanavanumeroita. Ylempi koodi puhuu vain:
+ *
+ *   - MEASUREMENT_ADC_INPUT_VDIVS
+ *   - MEASUREMENT_ADC_INPUT_KELVIN
+ */
 static HAL_StatusTypeDef measurement_adc_select_channel(measurement_adc_input_t input);
 
+/*
+ * ============================================================================
+ * Julkinen API
+ * ============================================================================
+ */
+
+/*
+ * Alustaa ADC:n mittaussovellusta varten.
+ *
+ * Tässä vaiheessa tämä tarkoittaa käytännössä ADC:n self-calibration-ajon
+ * käynnistämistä single-ended-tilassa.
+ *
+ * Oletus:
+ * - board_adc_hal_initialize() on jo kutsuttu aiemmin
+ * - hadc1 on siis alustettu ja käyttövalmis
+ *
+ * Miksi kalibrointi tehdään täällä:
+ * - board_adc_hal vastaa raudan alustuksesta
+ * - measurement_adc vastaa mittauskäyttöön valmistelusta
+ *
+ * Tämä jako pitää vastuut selkeinä.
+ */
 HAL_StatusTypeDef measurement_adc_initialize(void)
 {
     return HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED);
 }
 
+/*
+ * Lukee yhden näytteen valitulta ADC-tulolta.
+ *
+ * Työvaiheet:
+ *   1) valitaan oikea ADC-kanava
+ *   2) käynnistetään muunnos
+ *   3) odotetaan EOC (end of conversion)
+ *   4) luetaan raakakoodi
+ *   5) pysäytetään ADC
+ *
+ * Huom:
+ * Tämä funktio palauttaa 12-bittisen raakakoodin.
+ * Jännitemuunnos tehdään erillisellä helperillä.
+ */
 HAL_StatusTypeDef measurement_adc_read_single(
     measurement_adc_input_t input,
     uint16_t *result)
@@ -25,6 +141,13 @@ HAL_StatusTypeDef measurement_adc_read_single(
         return HAL_ERROR;
     }
 
+    /*
+     * Valitaan mitattava analogiasolmu.
+     *
+     * Tämä on puhtaasti ADC:n sisäinen kanavavalinta.
+     * Topologia eli se, mitä fyysisessä mittausverkossa tapahtuu, on jo
+     * päätetty aiemmin measurement_topology-kerroksessa.
+     */
     status = measurement_adc_select_channel(input);
     if (status != HAL_OK)
     {
@@ -56,6 +179,36 @@ HAL_StatusTypeDef measurement_adc_read_single(
     return HAL_OK;
 }
 
+/*
+ * Lukee useita näytteitä valitulta ADC-tulolta ja palauttaa niiden
+ * pyöristetyn keskiarvon.
+ *
+ * Parametrit:
+ * - input:
+ *     mitä analogiasolmua luetaan
+ *
+ * - discard_samples:
+ *     montako alkuarvoa hylätään
+ *
+ * - keep_samples:
+ *     montako arvoa otetaan mukaan keskiarvoon
+ *
+ * - result:
+ *     lopullinen raakakoodi
+ *
+ * Miksi tätä käytetään:
+ * - yksittäinen ADC-luku voi heilahdella hieman
+ * - topologian vaihdon jälkeen aivan ensimmäiset näytteet voivat olla
+ *   vähemmän stabiileja
+ * - keskiarvo antaa measurement_core:lle rauhallisemman jännitelukeman
+ *
+ * Toteutus:
+ * - kanava valitaan kerran ennen näytesarjaa
+ * - jokainen näyte otetaan start/poll/get/stop -sekvenssillä
+ * - discard_samples kappaletta hylätään
+ * - keep_samples kappaletta summataan
+ * - lopuksi lasketaan pyöristetty kokonaislukukeskiarvo
+ */
 HAL_StatusTypeDef measurement_adc_read_average(
     measurement_adc_input_t input,
     uint16_t discard_samples,
@@ -80,6 +233,13 @@ HAL_StatusTypeDef measurement_adc_read_average(
 
     total_samples = (uint32_t)discard_samples + (uint32_t)keep_samples;
 
+    /*
+     * Valitaan ADC-kanava kerran ennen koko näytesarjaa.
+     *
+     * Tämä on sekä tehokasta että loogisesti selkeää:
+     * kaikki tämän funktion aikana kerättävät näytteet tulevat samasta
+     * analogiasolmusta.
+     */
     status = measurement_adc_select_channel(input);
     if (status != HAL_OK)
     {
@@ -109,22 +269,74 @@ HAL_StatusTypeDef measurement_adc_read_average(
             return status;
         }
 
+        /*
+         * Ensimmäiset näytteet voidaan haluttaessa hylätä.
+         *
+         * Tämä on hyödyllistä erityisesti silloin, kun:
+         * - topologia on juuri vaihtunut
+         * - ADC:n sampling capacitor asettuu uuteen lähde-impedanssiin
+         * - halutaan vähentää transienttien vaikutusta
+         */
         if (index >= (uint32_t)discard_samples)
         {
             sum += raw_value;
         }
     }
 
+    /*
+     * Pyöristetty keskiarvo:
+     * lisätään keep_samples/2 ennen jakoa, jotta saadaan lähimpään
+     * kokonaislukuun pyöristyvä tulos eikä pelkkä truncation.
+     */
     *result = (uint16_t)((sum + ((uint32_t)keep_samples / 2U)) / (uint32_t)keep_samples);
 
     return HAL_OK;
 }
 
+/*
+ * Muuntaa 12-bittisen raakakoodin jännitteeksi.
+ *
+ * Kaava:
+ *
+ *   V = raw * Vref / 4095
+ *
+ * Tässä ei oleteta mitään tiettyä referenssijännitettä, vaan se annetaan
+ * parametrina. Näin sama helperi voidaan käyttää joustavasti mittauskerroksen
+ * eri kohdissa.
+ */
 float measurement_adc_convert_raw_to_voltage(uint16_t raw_value, float reference_voltage)
 {
     return ((float)raw_value * reference_voltage) / MEASUREMENT_ADC_MAX_RAW_12BIT;
 }
 
+/*
+ * ============================================================================
+ * Sisäinen kanavavalinta
+ * ============================================================================
+ */
+
+/*
+ * Valitsee ADC:n aktiivisen kanavan projektin mittaustarpeiden mukaan.
+ *
+ * Tämän projektin aktiiviset ADC-tulot:
+ *
+ *   VDIVS  -> PA7 -> ADC1_IN12
+ *   KELVIN -> PB0 -> ADC1_IN15
+ *
+ * SamplingTime:
+ * Käytössä on pitkä sampling time (640.5 cycles), koska se on tässä
+ * bring-up-vaiheessa turvallinen valinta:
+ *
+ * - VDIVS-solmun lähde-impedanssi vaihtelee eri topologioissa
+ * - Kelvin-haaran käyttäytyminen voi myös riippua analogisesta etuasteesta
+ * - pidempi sample-aika usein stabiloi lukemaa paremmin kuin hyvin lyhyt
+ *
+ * Tätä asetusta voidaan myöhemmin optimoida, jos:
+ * - mittausnopeutta halutaan nostaa
+ * - tiedetään tarkemmin eri haarojen lähde-impedanssit
+ * - bench-testeissä havaitaan, että jokin lyhyempi sample-aika toimii
+ *   yhtä hyvin
+ */
 static HAL_StatusTypeDef measurement_adc_select_channel(measurement_adc_input_t input)
 {
     ADC_ChannelConfTypeDef channel_configuration = {0};

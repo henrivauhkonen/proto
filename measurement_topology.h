@@ -9,43 +9,27 @@ extern "C" {
 #endif
 
 /*
- * Diodisuunnan ohjauspinnin toimintatila.
- *
- * HIGH_IMPEDANCE:
- *   Pinni asetetaan analog-tilaan, jolloin se toimii käytännössä Hi-Z-tilassa.
- *
- * DRIVE_LOW:
- *   Pinni asetetaan digitaaliseksi lähtöpiniksi ja ajetaan matalaksi.
- *
- * DRIVE_HIGH:
- *   Pinni asetetaan digitaaliseksi lähtöpiniksi ja ajetaan korkeaksi.
- */
-typedef enum
-{
-    DIODE_DIRECTION_HIGH_IMPEDANCE = 0,
-    DIODE_DIRECTION_DRIVE_LOW,
-    DIODE_DIRECTION_DRIVE_HIGH
-} diode_direction_mode_t;
-
-/*
  * DUT1-ohjauspinnin toimintatila.
  *
  * DUT1 on tässä projektissa firmware-ohjattu mittausterminaalin toinen puoli.
- * Toistaiseksi DUT1-ohjauspinniksi valitaan PB4.
+ * Tämänhetkisessä protoversiossa DUT1_CTRL on erillinen digitaalinen ohjaus-
+ * pinni, jolla voidaan:
  *
- * HIGH_IMPEDANCE:
- *   DUT1 vapautetaan (Hi-Z).
+ * - vapauttaa DUT1 (Hi-Z)
+ * - vetää DUT1 matalaksi
+ * - vetää DUT1 korkeaksi
  *
- * DRIVE_LOW:
- *   DUT1 vedetään matalaksi.
+ * Tämä sama DUT1_CTRL-pinni palvelee nyt useita topologioita:
  *
- * DRIVE_HIGH:
- *   DUT1 vedetään korkeaksi.
+ *   SAFE         -> Hi-Z
+ *   RESISTANCE_* -> LOW
+ *   KELVIN       -> HIGH
+ *   CAPACITANCE  -> LOW
+ *   DIODE_*      -> LOW tai HIGH mittaussuunnasta riippuen
  *
  * Huom:
- * Tässä protoversiossa KELVIN käyttää DUT1 = HIGH -tilaa, koska PB4
- * on osa Kelvin-kytkennän ohjausta juuri tämänhetkisen KiCad-/proto-
- * toteutuksen mukaisesti.
+ * Aiempi erillinen "diode direction" -pinni on poistunut käytöstä.
+ * Diodisuunta toteutetaan nykyisessä mallissa DUT1_CTRL-pinnillä.
  */
 typedef enum
 {
@@ -59,8 +43,9 @@ typedef enum
  *
  * Tämänhetkinen topologinen malli:
  *
- * - DUT1 ohjataan pinnillä (PB4)
+ * - DUT1 ohjataan erillisellä DUT1_CTRL-pinnillä
  * - DUT2 reititetään kahdella kytkimellä / releellä
+ * - VDIVS-jakoverkko on kolmialueinen: LOW / MID / HIGH
  *
  * K1:
  *   common = DUT2
@@ -76,28 +61,38 @@ typedef enum
  * - RESISTANCE_* käyttää VDIVS-solmua
  * - KELVIN käyttää Kelvin-ADC-polkuja
  * - CAPACITANCE käyttää TIM2_CH1 / PA0 -polkua
- * - Diodimittaus käyttää VDIVS-solmua + diode direction -pinniä
+ * - Diodimittaus käyttää VDIVS-solmua + DUT1_CTRL-ohjausta
  *
  * Huom:
  * PB6 / PB7 ovat tässä protovaiheessa releiden / kytkinasentojen
  * firmware-indikaatiot. Käsikytkimet simuloivat varsinaista relelogiikkaa.
+ *
+ * Huom 2:
+ * Nyt kun VDIVS-lähdeverkko on kolmialueinen, topologialuetteloon on lisätty
+ * MID-alue sekä resistanssi- että diodimittaukselle.
  */
-
 typedef enum
 {
     MEASUREMENT_TOPOLOGY_SAFE = 0,
     MEASUREMENT_TOPOLOGY_WAKE_SETTLE,
+
     MEASUREMENT_TOPOLOGY_RESISTANCE_HIGH_RANGE,
+    MEASUREMENT_TOPOLOGY_RESISTANCE_MID_RANGE,
     MEASUREMENT_TOPOLOGY_RESISTANCE_LOW_RANGE,
+
     MEASUREMENT_TOPOLOGY_KELVIN,
     MEASUREMENT_TOPOLOGY_CAPACITANCE,
+
     MEASUREMENT_TOPOLOGY_DIODE_FORWARD_LOW_RANGE,
+    MEASUREMENT_TOPOLOGY_DIODE_FORWARD_MID_RANGE,
     MEASUREMENT_TOPOLOGY_DIODE_FORWARD_HIGH_RANGE,
+
     MEASUREMENT_TOPOLOGY_DIODE_REVERSE_LOW_RANGE,
+    MEASUREMENT_TOPOLOGY_DIODE_REVERSE_MID_RANGE,
     MEASUREMENT_TOPOLOGY_DIODE_REVERSE_HIGH_RANGE,
+
     MEASUREMENT_TOPOLOGY_COUNT
 } measurement_topology_mode_t;
-
 
 /*
  * Kertoo mitä lukupolkua topologia normaalisti käyttää.
@@ -143,11 +138,15 @@ const char *measurement_topology_get_mode_name(measurement_topology_mode_t mode)
  * Low-level API jää myös näkyviin.
  *
  * Huom:
- * VDIVS low/high "enabled" tarkoittaa tässä projektissa:
+ * VDIVS low/mid/high "enabled" tarkoittaa tässä projektissa:
  *   enabled  -> output HIGH
  *   disabled -> analog / Hi-Z
+ *
+ * Näitä pinnejä ei sammuteta ajamalla LOW-tilaan, vaan vapauttamalla linja.
+ * Tämä vähentää riskiä kuormittaa VDIVS-solmua väärin topologian vaihdon aikana.
  */
 void measurement_topology_set_low_range_enabled(bool enabled);
+void measurement_topology_set_mid_range_enabled(bool enabled);
 void measurement_topology_set_high_range_enabled(bool enabled);
 
 /*
@@ -168,9 +167,9 @@ void measurement_topology_set_high_range_enabled(bool enabled);
 void measurement_topology_set_relay_1_enabled(bool enabled);
 void measurement_topology_set_relay_2_enabled(bool enabled);
 
-void measurement_topology_set_diode_direction(diode_direction_mode_t mode);
-diode_direction_mode_t measurement_topology_get_diode_direction(void);
-
+/*
+ * DUT1-ohjauksen low-level API.
+ */
 void measurement_topology_set_dut1_control_mode(measurement_dut1_control_mode_t mode);
 measurement_dut1_control_mode_t measurement_topology_get_dut1_control_mode(void);
 

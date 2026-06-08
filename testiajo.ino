@@ -2,6 +2,7 @@
 
 extern "C" {
 #include "board_adc_hal.h"
+#include "board_dac_hal.h"
 #include "measurement_adc.h"
 #include "measurement_capacitance.h"
 #include "measurement_topology.h"
@@ -11,7 +12,7 @@ extern "C" {
 /*
  * ============================================================================
  * Testiajo:
- *   1) resistiivinen baseline
+ *   1) resistiivinen baseline (HIGH + MID + LOW)
  *   2) Kelvin probe
  *   3) capacitance probe
  *   4) diode probe
@@ -39,14 +40,18 @@ extern "C" {
  *
  *   SAFE                  -> DUT1 Hi-Z
  *   RESISTANCE_HIGH_RANGE -> DUT1 LOW
+ *   RESISTANCE_MID_RANGE  -> DUT1 LOW
  *   RESISTANCE_LOW_RANGE  -> DUT1 LOW
  *   KELVIN                -> DUT1 HIGH
  *   CAPACITANCE           -> DUT1 LOW
- *   DIODE_*               -> DUT1 LOW   (tässä ensimmäisessä toteutuksessa)
+ *   DIODE_FORWARD_*       -> DUT1 forward-polariteetti
+ *   DIODE_REVERSE_*       -> DUT1 reverse-polariteetti
  *
  * Tässä vaiheessa:
  * - ei tehdä vielä lopullista koko järjestelmän komponenttitunnistusta
  * - kelvin / cap / diode ovat erillisiä probe-vaiheita
+ * - diodisuunta toteutuu DUT1-ohjauksella, ei erillisellä diode direction
+ *   -pinnillä
  */
 
 #define TEST_LOG_TAG               "TEST"
@@ -82,8 +87,9 @@ static void test_log_baseline_result(const measurement_data_t *data)
 
     LOG_DEBUG(
         TEST_LOG_TAG,
-        "Flags: high_valid=%u low_valid=%u",
+        "Flags: high_valid=%u mid_valid=%u low_valid=%u",
         data->res_high_resistance_valid ? 1U : 0U,
+        data->res_mid_resistance_valid ? 1U : 0U,
         data->res_low_resistance_valid ? 1U : 0U);
 
     if (data->res_high_resistance_valid)
@@ -94,6 +100,14 @@ static void test_log_baseline_result(const measurement_data_t *data)
             (double)data->res_high_estimated_resistance_ohms);
     }
 
+    if (data->res_mid_resistance_valid)
+    {
+        LOG_DEBUG(
+            TEST_LOG_TAG,
+            "Estimated RES_MID resistance -> %.1f ohm",
+            (double)data->res_mid_estimated_resistance_ohms);
+    }
+
     if (data->res_low_resistance_valid)
     {
         LOG_DEBUG(
@@ -101,6 +115,14 @@ static void test_log_baseline_result(const measurement_data_t *data)
             "Estimated RES_LOW resistance -> %.1f ohm",
             (double)data->res_low_estimated_resistance_ohms);
     }
+
+    LOG_DEBUG(
+        TEST_LOG_TAG,
+        "Baseline voltages -> SAFE=%.4f HIGH=%.4f MID=%.4f LOW=%.4f",
+        (double)data->safe_voltage_v,
+        (double)data->res_high_voltage_v,
+        (double)data->res_mid_voltage_v,
+        (double)data->res_low_voltage_v);
 }
 
 /*
@@ -199,10 +221,14 @@ static void test_log_diode_result(const measurement_data_t *data)
 
     LOG_INFO(
         TEST_LOG_TAG,
-        "Diode voltages -> FWD_LOW=%.4f FWD_HIGH=%.4f REV_LOW=%.4f REV_HIGH=%.4f",
+        "Diode voltages -> "
+        "FWD_LOW=%.4f FWD_MID=%.4f FWD_HIGH=%.4f "
+        "REV_LOW=%.4f REV_MID=%.4f REV_HIGH=%.4f",
         (double)data->diode_forward_low_voltage_v,
+        (double)data->diode_forward_mid_voltage_v,
         (double)data->diode_forward_high_voltage_v,
         (double)data->diode_reverse_low_voltage_v,
+        (double)data->diode_reverse_mid_voltage_v,
         (double)data->diode_reverse_high_voltage_v);
 
     LOG_DEBUG(
@@ -243,6 +269,29 @@ void setup()
         LOG_ERROR(TEST_LOG_TAG, "measurement_adc_initialize failed");
         while (1) { }
     }
+
+    /*
+     * DAC HAL.
+     *
+     * PA4 = DAC1_OUT1 = REF_1V_DAC1_OUT1 / CC_REF
+     */
+    if (board_dac_hal_initialize() != HAL_OK)
+    {
+        LOG_ERROR(TEST_LOG_TAG, "board_dac_hal_initialize failed");
+        while (1) { }
+    }
+
+    if (board_dac_hal_set_voltage(1.0f, 3.3f) != HAL_OK)
+    {
+        LOG_ERROR(TEST_LOG_TAG, "board_dac_hal_set_voltage failed");
+        while (1) { }
+    }
+
+    LOG_INFO(
+        TEST_LOG_TAG,
+        "DAC ready -> PA4 / CC_REF = %.3f V (raw=%u)",
+        (double)board_dac_hal_get_last_voltage(),
+        board_dac_hal_get_last_raw_12bit());
 
     /*
      * TIM2-based capacitance measurement init.
@@ -286,6 +335,11 @@ void loop()
      * Kytkimet:
      * - K1 = oikea
      * - K2 = vasen
+     *
+     * Tämä mittaa nyt kaikki kolme VDIVS-haaraa:
+     * - HIGH = 470k
+     * - MID  = 56k
+     * - LOW  = 820R
      */
     LOG_INFO(TEST_LOG_TAG, "Running resistor baseline");
 
@@ -356,7 +410,8 @@ void loop()
      * - K1 = oikea
      * - K2 = vasen
      *
-     * Tämä käyttää VDIVS-polun ADC-lukua sekä diode direction -pinniä.
+     * Tämä käyttää VDIVS-solmun ADC-lukua.
+     * Mittaussuunta toteutuu DUT1-ohjauksella topologiakerroksessa.
      */
     LOG_INFO(TEST_LOG_TAG, "Running diode probe");
 

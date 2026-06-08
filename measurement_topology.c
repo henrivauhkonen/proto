@@ -15,11 +15,18 @@
  * Tämänhetkinen STM32duino / proto-pinout:
  *
  *   PA3  = VDIVS low-range drive
- *   PA4  = VDIVS high-range drive
+ *   PA12 = VDIVS mid-range drive
+ *   PB1  = VDIVS high-range drive
  *   PB4  = DUT1 control
  *   PB6  = relay / switch K1 indication
  *   PB7  = relay / switch K2 indication
- *   PA12 = diode direction
+ *
+ * Lisäksi projektissa on muita pinnejä, joita tämä topologiakerros EI ohjaa:
+ *
+ *   PA4  = REF_1V_DAC1_OUT1
+ *   PA7  = HIGH_R_ADC1_IN12
+ *   PB0  = LOW_R_ADC1_IN15
+ *   PA9  = TFT_BL_TIM1_CH2
  *
  * Tärkeä topologinen kokonaiskuva:
  *
@@ -41,23 +48,26 @@
  * - RESISTANCE_* käyttää:
  *     K1 = right
  *     K2 = left
+ *     DUT2 -> VDIVS
  *     DUT1 = LOW
  *
  * - KELVIN käyttää:
  *     K1 = right
  *     K2 = right
+ *     DUT2 -> KELVIN
  *     DUT1 = HIGH
  *
  * - CAPACITANCE käyttää:
  *     K1 = left
  *     K2 = don't care
+ *     DUT2 -> CAPACITANCE
  *     DUT1 = LOW
  *
  * - DIODE_* käyttää:
  *     K1 = right
  *     K2 = left
- *     diode direction = PA12
- *     DUT1 = LOW   (tässä ensimmäisessä toteutusversiossa)
+ *     DUT2 -> VDIVS
+ *     DUT1_CTRL valitsee forward/reverse-suunnan
  *
  * Huom:
  * PB6 / PB7 ovat tässä protovaiheessa releiden / kytkinasentojen
@@ -67,8 +77,11 @@
 #define PIN_VDIVS_LOW               GPIO_PIN_3
 #define PORT_VDIVS_LOW              GPIOA
 
-#define PIN_VDIVS_HIGH              GPIO_PIN_4
-#define PORT_VDIVS_HIGH             GPIOA
+#define PIN_VDIVS_MID               GPIO_PIN_12
+#define PORT_VDIVS_MID              GPIOA
+
+#define PIN_VDIVS_HIGH              GPIO_PIN_1
+#define PORT_VDIVS_HIGH             GPIOB
 
 #define PIN_DUT1_CONTROL            GPIO_PIN_4
 #define PORT_DUT1_CONTROL           GPIOB
@@ -79,41 +92,36 @@
 #define PIN_RELAY_2                 GPIO_PIN_7
 #define PORT_RELAY_2                GPIOB
 
-#define PIN_DIODE_DIRECTION         GPIO_PIN_12
-#define PORT_DIODE_DIRECTION        GPIOA
-
 /*
  * ============================================================================
  * Diodimoodin tämänhetkiset bench-oletukset
  * ============================================================================
  *
- * Diodimittauksen ensimmäisessä integroidussa versiossa oletetaan:
+ * Diodimittauksen tämänhetkisessä versiossa oletetaan:
  *
  * - DUT2 reititetään VDIVS-haaraan:
  *     K1 = right
  *     K2 = left
  *
- * - DUT1 pidetään LOW-tilassa
+ * - forward / reverse -suunta tehdään DUT1_CTRL-pinnillä:
+ *     FORWARD -> DUT1 = LOW
+ *     REVERSE -> DUT1 = HIGH
  *
- * - diode direction -pinni (PA12) valitsee mittaussuunnan:
- *     FORWARD  -> diode direction = LOW
- *     REVERSE  -> diode direction = HIGH
+ * - VDIVS-lähde voidaan valita LOW / MID / HIGH -alueista
  *
  * Jos bench-testit myöhemmin osoittavat, että:
- * - DUT1 pitäisi olla Hi-Z eikä LOW
- * - TAI FORWARD/REVERSE ovat loogisesti toisin päin
+ * - FORWARD/REVERSE ovat loogisesti toisin päin
+ * - tai jokin range ei ole hyödyllinen diodiproben kannalta
  *
- * silloin korjaus onnistuu vaihtamalla vain näitä makroja.
+ * silloin korjaus onnistuu vaihtamalla vain näitä makroja tai
+ * state map -taulukon rivejä.
  */
 
-#define MEASUREMENT_TOPOLOGY_DIODE_DUT1_MODE \
+#define MEASUREMENT_TOPOLOGY_DIODE_FORWARD_DUT1_MODE \
     MEASUREMENT_DUT1_CONTROL_DRIVE_LOW
 
-#define MEASUREMENT_TOPOLOGY_DIODE_FORWARD_DIRECTION \
-    DIODE_DIRECTION_DRIVE_LOW
-
-#define MEASUREMENT_TOPOLOGY_DIODE_REVERSE_DIRECTION \
-    DIODE_DIRECTION_DRIVE_HIGH
+#define MEASUREMENT_TOPOLOGY_DIODE_REVERSE_DUT1_MODE \
+    MEASUREMENT_DUT1_CONTROL_DRIVE_HIGH
 
 /*
  * ============================================================================
@@ -136,11 +144,11 @@
  * low_range_enabled:
  *   PA3 syöttää VDIVS low-range vastushaaraa
  *
- * high_range_enabled:
- *   PA4 syöttää VDIVS high-range vastushaaraa
+ * mid_range_enabled:
+ *   PA12 syöttää VDIVS mid-range vastushaaraa
  *
- * diode_direction:
- *   PA12 tila diodimittauksessa
+ * high_range_enabled:
+ *   PB1 syöttää VDIVS high-range vastushaaraa
  *
  * dut1_control_mode:
  *   PB4 tila valitussa topologiassa
@@ -153,8 +161,8 @@ typedef struct
     bool relay1_enabled;
     bool relay2_enabled;
     bool low_range_enabled;
+    bool mid_range_enabled;
     bool high_range_enabled;
-    diode_direction_mode_t diode_direction;
     measurement_dut1_control_mode_t dut1_control_mode;
     measurement_read_path_t read_path;
 } measurement_topology_state_t;
@@ -164,9 +172,6 @@ typedef struct
  * Sisäinen tila (statuskyselyitä ja debugia varten)
  * ============================================================================
  */
-
-static diode_direction_mode_t current_diode_direction_mode =
-    DIODE_DIRECTION_HIGH_IMPEDANCE;
 
 static measurement_dut1_control_mode_t current_dut1_control_mode =
     MEASUREMENT_DUT1_CONTROL_HIGH_IMPEDANCE;
@@ -179,8 +184,8 @@ static measurement_topology_mode_t current_topology_mode =
  * Sisäiset GPIO-helperit
  * ============================================================================
  *
- * Tässä topologiassa PA3 ja PA4 eivät ole tavallisia "on/off output" -pinnejä,
- * vaan ne syöttävät VDIVS-solmua vastusten kautta.
+ * Tässä topologiassa PA3 / PA12 / PB1 eivät ole tavallisia "on/off output"
+ * -pinnejä, vaan ne syöttävät VDIVS-solmua vastusten kautta.
  *
  * Siksi "disabled" EI saa tarkoittaa GPIO LOW, vaan linjan vapauttamista.
  *
@@ -279,35 +284,6 @@ static void measurement_topology_enable_gpio_clocks(void)
 
 /*
  * ============================================================================
- * Sisäiset helperit diodisuunnan ohjaukseen
- * ============================================================================
- */
-
-static void measurement_topology_set_diode_direction_high_impedance_internal(void)
-{
-    measurement_topology_set_pin_high_impedance(
-        PORT_DIODE_DIRECTION,
-        PIN_DIODE_DIRECTION);
-}
-
-static void measurement_topology_set_diode_direction_output_internal(GPIO_PinState pin_state)
-{
-    if (pin_state == GPIO_PIN_SET)
-    {
-        measurement_topology_set_pin_output_high(
-            PORT_DIODE_DIRECTION,
-            PIN_DIODE_DIRECTION);
-    }
-    else
-    {
-        measurement_topology_set_pin_output_low(
-            PORT_DIODE_DIRECTION,
-            PIN_DIODE_DIRECTION);
-    }
-}
-
-/*
- * ============================================================================
  * Topologioiden state map
  * ============================================================================
  *
@@ -317,10 +293,12 @@ static void measurement_topology_set_diode_direction_output_internal(GPIO_PinSta
  *   SAFE                         -> Hi-Z
  *   WAKE_SETTLE                  -> Hi-Z
  *   RESISTANCE_HIGH_RANGE        -> LOW
+ *   RESISTANCE_MID_RANGE         -> LOW
  *   RESISTANCE_LOW_RANGE         -> LOW
  *   KELVIN                       -> HIGH
  *   CAPACITANCE                  -> LOW
- *   DIODE_*                      -> LOW
+ *   DIODE_FORWARD_*              -> LOW
+ *   DIODE_REVERSE_*              -> HIGH
  *
  * Kytkinreitti:
  *
@@ -342,17 +320,18 @@ static void measurement_topology_set_diode_direction_output_internal(GPIO_PinSta
  *   K1 -> right
  *   K2 -> left
  *   DUT2 -> VDIVS
- *   diode direction ohjaa forward/reverse-suunnan
+ *   DUT1 ohjaa forward/reverse-suunnan
  */
-static const measurement_topology_state_t g_measurement_topology_states[MEASUREMENT_TOPOLOGY_COUNT] =
+static const measurement_topology_state_t
+g_measurement_topology_states[MEASUREMENT_TOPOLOGY_COUNT] =
 {
     [MEASUREMENT_TOPOLOGY_SAFE] =
     {
         .relay1_enabled = false,
         .relay2_enabled = false,
         .low_range_enabled = false,
+        .mid_range_enabled = false,
         .high_range_enabled = false,
-        .diode_direction = DIODE_DIRECTION_HIGH_IMPEDANCE,
         .dut1_control_mode = MEASUREMENT_DUT1_CONTROL_HIGH_IMPEDANCE,
         .read_path = MEASUREMENT_READ_PATH_NONE
     },
@@ -362,97 +341,130 @@ static const measurement_topology_state_t g_measurement_topology_states[MEASUREM
         .relay1_enabled = false,
         .relay2_enabled = false,
         .low_range_enabled = false,
+        .mid_range_enabled = false,
         .high_range_enabled = false,
-        .diode_direction = DIODE_DIRECTION_HIGH_IMPEDANCE,
         .dut1_control_mode = MEASUREMENT_DUT1_CONTROL_HIGH_IMPEDANCE,
         .read_path = MEASUREMENT_READ_PATH_NONE
     },
 
     [MEASUREMENT_TOPOLOGY_RESISTANCE_HIGH_RANGE] =
     {
-        .relay1_enabled = true,     /* K1 -> right -> K2 */
-        .relay2_enabled = true,     /* K2 -> left  -> VDIVS */
+        .relay1_enabled = true,      /* K1 -> right -> K2 */
+        .relay2_enabled = true,      /* K2 -> left  -> VDIVS */
         .low_range_enabled = false,
-        .high_range_enabled = true, /* PA4 HIGH -> high-range resistor -> VDIVS */
-        .diode_direction = DIODE_DIRECTION_HIGH_IMPEDANCE,
+        .mid_range_enabled = false,
+        .high_range_enabled = true,  /* PB1 HIGH -> high-range resistor -> VDIVS */
+        .dut1_control_mode = MEASUREMENT_DUT1_CONTROL_DRIVE_LOW,
+        .read_path = MEASUREMENT_READ_PATH_VDIVS_ADC
+    },
+
+    [MEASUREMENT_TOPOLOGY_RESISTANCE_MID_RANGE] =
+    {
+        .relay1_enabled = true,      /* K1 -> right -> K2 */
+        .relay2_enabled = true,      /* K2 -> left  -> VDIVS */
+        .low_range_enabled = false,
+        .mid_range_enabled = true,   /* PA12 HIGH -> mid-range resistor -> VDIVS */
+        .high_range_enabled = false,
         .dut1_control_mode = MEASUREMENT_DUT1_CONTROL_DRIVE_LOW,
         .read_path = MEASUREMENT_READ_PATH_VDIVS_ADC
     },
 
     [MEASUREMENT_TOPOLOGY_RESISTANCE_LOW_RANGE] =
     {
-        .relay1_enabled = true,     /* K1 -> right -> K2 */
-        .relay2_enabled = true,     /* K2 -> left  -> VDIVS */
-        .low_range_enabled = true,  /* PA3 HIGH -> low-range resistor -> VDIVS */
+        .relay1_enabled = true,      /* K1 -> right -> K2 */
+        .relay2_enabled = true,      /* K2 -> left  -> VDIVS */
+        .low_range_enabled = true,   /* PA3 HIGH -> low-range resistor -> VDIVS */
+        .mid_range_enabled = false,
         .high_range_enabled = false,
-        .diode_direction = DIODE_DIRECTION_HIGH_IMPEDANCE,
         .dut1_control_mode = MEASUREMENT_DUT1_CONTROL_DRIVE_LOW,
         .read_path = MEASUREMENT_READ_PATH_VDIVS_ADC
     },
 
     [MEASUREMENT_TOPOLOGY_KELVIN] =
     {
-        .relay1_enabled = true,     /* K1 -> right -> K2 */
-        .relay2_enabled = false,    /* K2 -> right -> KELVIN */
+        .relay1_enabled = true,      /* K1 -> right -> K2 */
+        .relay2_enabled = false,     /* K2 -> right -> KELVIN */
         .low_range_enabled = false,
+        .mid_range_enabled = false,
         .high_range_enabled = false,
-        .diode_direction = DIODE_DIRECTION_HIGH_IMPEDANCE,
         .dut1_control_mode = MEASUREMENT_DUT1_CONTROL_DRIVE_HIGH,
         .read_path = MEASUREMENT_READ_PATH_KELVIN_ADC
     },
 
     [MEASUREMENT_TOPOLOGY_CAPACITANCE] =
     {
-        .relay1_enabled = false,    /* K1 -> left -> CAPACITANCE */
-        .relay2_enabled = false,    /* don't care, pidetään tunnetussa tilassa */
+        .relay1_enabled = false,     /* K1 -> left -> CAPACITANCE */
+        .relay2_enabled = false,     /* don't care, pidetään tunnetussa tilassa */
         .low_range_enabled = false,
+        .mid_range_enabled = false,
         .high_range_enabled = false,
-        .diode_direction = DIODE_DIRECTION_HIGH_IMPEDANCE,
         .dut1_control_mode = MEASUREMENT_DUT1_CONTROL_DRIVE_LOW,
         .read_path = MEASUREMENT_READ_PATH_TIM2_CH1
     },
 
     [MEASUREMENT_TOPOLOGY_DIODE_FORWARD_LOW_RANGE] =
     {
-        .relay1_enabled = true,     /* K1 -> right -> K2 */
-        .relay2_enabled = true,     /* K2 -> left  -> VDIVS */
-        .low_range_enabled = true,  /* low-range source resistor active */
+        .relay1_enabled = true,      /* K1 -> right -> K2 */
+        .relay2_enabled = true,      /* K2 -> left  -> VDIVS */
+        .low_range_enabled = true,   /* low-range source resistor active */
+        .mid_range_enabled = false,
         .high_range_enabled = false,
-        .diode_direction = MEASUREMENT_TOPOLOGY_DIODE_FORWARD_DIRECTION,
-        .dut1_control_mode = MEASUREMENT_TOPOLOGY_DIODE_DUT1_MODE,
+        .dut1_control_mode = MEASUREMENT_TOPOLOGY_DIODE_FORWARD_DUT1_MODE,
+        .read_path = MEASUREMENT_READ_PATH_VDIVS_ADC
+    },
+
+    [MEASUREMENT_TOPOLOGY_DIODE_FORWARD_MID_RANGE] =
+    {
+        .relay1_enabled = true,      /* K1 -> right -> K2 */
+        .relay2_enabled = true,      /* K2 -> left  -> VDIVS */
+        .low_range_enabled = false,
+        .mid_range_enabled = true,   /* mid-range source resistor active */
+        .high_range_enabled = false,
+        .dut1_control_mode = MEASUREMENT_TOPOLOGY_DIODE_FORWARD_DUT1_MODE,
         .read_path = MEASUREMENT_READ_PATH_VDIVS_ADC
     },
 
     [MEASUREMENT_TOPOLOGY_DIODE_FORWARD_HIGH_RANGE] =
     {
-        .relay1_enabled = true,     /* K1 -> right -> K2 */
-        .relay2_enabled = true,     /* K2 -> left  -> VDIVS */
+        .relay1_enabled = true,      /* K1 -> right -> K2 */
+        .relay2_enabled = true,      /* K2 -> left  -> VDIVS */
         .low_range_enabled = false,
-        .high_range_enabled = true, /* high-range source resistor active */
-        .diode_direction = MEASUREMENT_TOPOLOGY_DIODE_FORWARD_DIRECTION,
-        .dut1_control_mode = MEASUREMENT_TOPOLOGY_DIODE_DUT1_MODE,
+        .mid_range_enabled = false,
+        .high_range_enabled = true,  /* high-range source resistor active */
+        .dut1_control_mode = MEASUREMENT_TOPOLOGY_DIODE_FORWARD_DUT1_MODE,
         .read_path = MEASUREMENT_READ_PATH_VDIVS_ADC
     },
 
     [MEASUREMENT_TOPOLOGY_DIODE_REVERSE_LOW_RANGE] =
     {
-        .relay1_enabled = true,     /* K1 -> right -> K2 */
-        .relay2_enabled = true,     /* K2 -> left  -> VDIVS */
+        .relay1_enabled = true,      /* K1 -> right -> K2 */
+        .relay2_enabled = true,      /* K2 -> left  -> VDIVS */
         .low_range_enabled = true,
+        .mid_range_enabled = false,
         .high_range_enabled = false,
-        .diode_direction = MEASUREMENT_TOPOLOGY_DIODE_REVERSE_DIRECTION,
-        .dut1_control_mode = MEASUREMENT_TOPOLOGY_DIODE_DUT1_MODE,
+        .dut1_control_mode = MEASUREMENT_TOPOLOGY_DIODE_REVERSE_DUT1_MODE,
+        .read_path = MEASUREMENT_READ_PATH_VDIVS_ADC
+    },
+
+    [MEASUREMENT_TOPOLOGY_DIODE_REVERSE_MID_RANGE] =
+    {
+        .relay1_enabled = true,      /* K1 -> right -> K2 */
+        .relay2_enabled = true,      /* K2 -> left  -> VDIVS */
+        .low_range_enabled = false,
+        .mid_range_enabled = true,
+        .high_range_enabled = false,
+        .dut1_control_mode = MEASUREMENT_TOPOLOGY_DIODE_REVERSE_DUT1_MODE,
         .read_path = MEASUREMENT_READ_PATH_VDIVS_ADC
     },
 
     [MEASUREMENT_TOPOLOGY_DIODE_REVERSE_HIGH_RANGE] =
     {
-        .relay1_enabled = true,     /* K1 -> right -> K2 */
-        .relay2_enabled = true,     /* K2 -> left  -> VDIVS */
+        .relay1_enabled = true,      /* K1 -> right -> K2 */
+        .relay2_enabled = true,      /* K2 -> left  -> VDIVS */
         .low_range_enabled = false,
+        .mid_range_enabled = false,
         .high_range_enabled = true,
-        .diode_direction = MEASUREMENT_TOPOLOGY_DIODE_REVERSE_DIRECTION,
-        .dut1_control_mode = MEASUREMENT_TOPOLOGY_DIODE_DUT1_MODE,
+        .dut1_control_mode = MEASUREMENT_TOPOLOGY_DIODE_REVERSE_DUT1_MODE,
         .read_path = MEASUREMENT_READ_PATH_VDIVS_ADC
     }
 };
@@ -472,6 +484,18 @@ void measurement_topology_set_low_range_enabled(bool enabled)
     else
     {
         measurement_topology_set_pin_high_impedance(PORT_VDIVS_LOW, PIN_VDIVS_LOW);
+    }
+}
+
+void measurement_topology_set_mid_range_enabled(bool enabled)
+{
+    if (enabled)
+    {
+        measurement_topology_set_pin_output_high(PORT_VDIVS_MID, PIN_VDIVS_MID);
+    }
+    else
+    {
+        measurement_topology_set_pin_high_impedance(PORT_VDIVS_MID, PIN_VDIVS_MID);
     }
 }
 
@@ -501,37 +525,6 @@ void measurement_topology_set_relay_2_enabled(bool enabled)
         PORT_RELAY_2,
         PIN_RELAY_2,
         enabled ? GPIO_PIN_SET : GPIO_PIN_RESET);
-}
-
-void measurement_topology_set_diode_direction(diode_direction_mode_t mode)
-{
-    switch (mode)
-    {
-        case DIODE_DIRECTION_HIGH_IMPEDANCE:
-            measurement_topology_set_diode_direction_high_impedance_internal();
-            current_diode_direction_mode = DIODE_DIRECTION_HIGH_IMPEDANCE;
-            break;
-
-        case DIODE_DIRECTION_DRIVE_LOW:
-            measurement_topology_set_diode_direction_output_internal(GPIO_PIN_RESET);
-            current_diode_direction_mode = DIODE_DIRECTION_DRIVE_LOW;
-            break;
-
-        case DIODE_DIRECTION_DRIVE_HIGH:
-            measurement_topology_set_diode_direction_output_internal(GPIO_PIN_SET);
-            current_diode_direction_mode = DIODE_DIRECTION_DRIVE_HIGH;
-            break;
-
-        default:
-            measurement_topology_set_diode_direction_high_impedance_internal();
-            current_diode_direction_mode = DIODE_DIRECTION_HIGH_IMPEDANCE;
-            break;
-    }
-}
-
-diode_direction_mode_t measurement_topology_get_diode_direction(void)
-{
-    return current_diode_direction_mode;
 }
 
 void measurement_topology_set_dut1_control_mode(measurement_dut1_control_mode_t mode)
@@ -605,43 +598,50 @@ HAL_StatusTypeDef measurement_topology_apply(measurement_topology_mode_t mode)
 
     /*
      * Passiivinen välitila:
-     * - molemmat VDIVS-ajurit Hi-Z
+     * - kaikki VDIVS-ajurit Hi-Z
      * - DUT1 vapautetaan
      * - rele/kytkinindikaatiot tunnettuun tilaan
-     * - diodisuunta Hi-Z
      *
      * Tämä vähentää riskiä, että topologian vaihto aiheuttaisi hetkellisiä
      * ristiohjauksia tai lataisi väärän mittaushaaran.
      */
     measurement_topology_set_low_range_enabled(false);
+    measurement_topology_set_mid_range_enabled(false);
     measurement_topology_set_high_range_enabled(false);
     measurement_topology_set_dut1_control_mode(MEASUREMENT_DUT1_CONTROL_HIGH_IMPEDANCE);
     measurement_topology_set_relay_1_enabled(false);
     measurement_topology_set_relay_2_enabled(false);
-    measurement_topology_set_diode_direction(DIODE_DIRECTION_HIGH_IMPEDANCE);
 
     /*
      * Kohdetilan asetus state mapin mukaan.
+     *
+     * Järjestys:
+     *  1) reititys tunnettuun kohdeasentoon
+     *  2) DUT1-ohjaus kohdetilaan
+     *  3) aktiivinen VDIVS-range päälle
+     *
+     * Näin aktiiviset lähteet kytkeytyvät vasta sen jälkeen, kun reitti on
+     * jo valittu.
      */
-    measurement_topology_set_diode_direction(state->diode_direction);
-    measurement_topology_set_dut1_control_mode(state->dut1_control_mode);
-    measurement_topology_set_low_range_enabled(state->low_range_enabled);
-    measurement_topology_set_high_range_enabled(state->high_range_enabled);
     measurement_topology_set_relay_1_enabled(state->relay1_enabled);
     measurement_topology_set_relay_2_enabled(state->relay2_enabled);
+    measurement_topology_set_dut1_control_mode(state->dut1_control_mode);
+    measurement_topology_set_low_range_enabled(state->low_range_enabled);
+    measurement_topology_set_mid_range_enabled(state->mid_range_enabled);
+    measurement_topology_set_high_range_enabled(state->high_range_enabled);
 
     current_topology_mode = mode;
 
     LOG_DEBUG(
         MEASUREMENT_TOPOLOGY_LOG_TAG,
-        "APPLY mode=%s relay1=%u relay2=%u low=%u high=%u dut1=%u diode=%u read=%u",
+        "APPLY mode=%s relay1=%u relay2=%u low=%u mid=%u high=%u dut1=%u read=%u",
         measurement_topology_get_mode_name(current_topology_mode),
         state->relay1_enabled ? 1U : 0U,
         state->relay2_enabled ? 1U : 0U,
         state->low_range_enabled ? 1U : 0U,
+        state->mid_range_enabled ? 1U : 0U,
         state->high_range_enabled ? 1U : 0U,
         (unsigned int)state->dut1_control_mode,
-        (unsigned int)state->diode_direction,
         (unsigned int)state->read_path);
 
     return HAL_OK;
@@ -675,6 +675,9 @@ const char *measurement_topology_get_mode_name(measurement_topology_mode_t mode)
         case MEASUREMENT_TOPOLOGY_RESISTANCE_HIGH_RANGE:
             return "RESISTANCE_HIGH_RANGE";
 
+        case MEASUREMENT_TOPOLOGY_RESISTANCE_MID_RANGE:
+            return "RESISTANCE_MID_RANGE";
+
         case MEASUREMENT_TOPOLOGY_RESISTANCE_LOW_RANGE:
             return "RESISTANCE_LOW_RANGE";
 
@@ -687,11 +690,17 @@ const char *measurement_topology_get_mode_name(measurement_topology_mode_t mode)
         case MEASUREMENT_TOPOLOGY_DIODE_FORWARD_LOW_RANGE:
             return "DIODE_FORWARD_LOW_RANGE";
 
+        case MEASUREMENT_TOPOLOGY_DIODE_FORWARD_MID_RANGE:
+            return "DIODE_FORWARD_MID_RANGE";
+
         case MEASUREMENT_TOPOLOGY_DIODE_FORWARD_HIGH_RANGE:
             return "DIODE_FORWARD_HIGH_RANGE";
 
         case MEASUREMENT_TOPOLOGY_DIODE_REVERSE_LOW_RANGE:
             return "DIODE_REVERSE_LOW_RANGE";
+
+        case MEASUREMENT_TOPOLOGY_DIODE_REVERSE_MID_RANGE:
+            return "DIODE_REVERSE_MID_RANGE";
 
         case MEASUREMENT_TOPOLOGY_DIODE_REVERSE_HIGH_RANGE:
             return "DIODE_REVERSE_HIGH_RANGE";

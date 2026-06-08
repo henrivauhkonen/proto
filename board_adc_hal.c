@@ -2,6 +2,26 @@
 
 ADC_HandleTypeDef hadc1;
 
+/*
+ * ============================================================================
+ * Sisäinen MSP-/rauta-alustus ADC1:lle
+ * ============================================================================
+ *
+ * Tämä helperi hoitaa:
+ * - ADC-kellon valinnan
+ * - ADC:n tarvitsemien GPIO-porttien kellot
+ * - ADC-tulopinnejä analog-tilaan
+ *
+ * Projektin tämänhetkiset ADC-tulot:
+ *
+ *   PA7 -> ADC1_IN12 -> VDIVS ADC
+ *   PB0 -> ADC1_IN15 -> KELVIN ADC
+ *
+ * Huom:
+ * VDIVS ADC lukee aina samaa VDIVS-solmua. Se, mikä resistiivinen haara
+ * (LOW / MID / HIGH) kyseistä solmua kulloinkin syöttää, päätetään
+ * topologiakerroksessa eikä tässä tiedostossa.
+ */
 static HAL_StatusTypeDef board_adc_hal_msp_init(void)
 {
     GPIO_InitTypeDef gpio = {0};
@@ -9,6 +29,9 @@ static HAL_StatusTypeDef board_adc_hal_msp_init(void)
 
     /*
      * Sama ADC-kelloratkaisun idea kuin nykyisessä CubeMX adc.c:ssä.
+     *
+     * ADC kellotetaan PLLSAI1-lähteestä.
+     * Tämä on tässä vaiheessa hyvä ja toimiva perusratkaisu bring-upiin.
      */
     periph_clk.PeriphClockSelection = RCC_PERIPHCLK_ADC;
     periph_clk.AdcClockSelection = RCC_ADCCLKSOURCE_PLLSAI1;
@@ -31,6 +54,14 @@ static HAL_StatusTypeDef board_adc_hal_msp_init(void)
 
     /*
      * PA7 -> ADC1_IN12 -> VDIVS
+     *
+     * Tämä on yhteinen VDIVS-lukupiste kaikille VDIVS-haaroille:
+     * - LOW  = 820 Ω
+     * - MID  = 56 kΩ
+     * - HIGH = 470 kΩ
+     *
+     * Topologiakerros päättää mikä haara on aktiivinen.
+     * ADC HAL vain konfiguroi lukupisteen.
      */
     gpio.Pin = GPIO_PIN_7;
     gpio.Mode = GPIO_MODE_ANALOG_ADC_CONTROL;
@@ -39,6 +70,8 @@ static HAL_StatusTypeDef board_adc_hal_msp_init(void)
 
     /*
      * PB0 -> ADC1_IN15 -> KELVIN
+     *
+     * Tämä tulokanava on varattu Kelvin-haaran lukemiseen.
      */
     gpio.Pin = GPIO_PIN_0;
     gpio.Mode = GPIO_MODE_ANALOG_ADC_CONTROL;
@@ -83,7 +116,10 @@ HAL_StatusTypeDef board_adc_hal_initialize(void)
 
     /*
      * Oletuskanava vain validia init-polkuja varten.
-     * measurement_adc.c vaihtaa kanavaa myöhemmin itse.
+     *
+     * Varsinainen measurement_adc.c vaihtaa kanavaa myöhemmin itse.
+     * Oletukseksi valitaan tässä KELVIN-kanava (ADC1_IN15 / PB0),
+     * kuten aiemmassakin rungossa.
      */
     sConfig.Channel = ADC_CHANNEL_15;
     sConfig.Rank = ADC_REGULAR_RANK_1;
@@ -112,8 +148,12 @@ HAL_StatusTypeDef board_adc_hal_deinitialize(void)
     }
 
     __HAL_RCC_ADC_CLK_DISABLE();
-    HAL_GPIO_DeInit(GPIOA, GPIO_PIN_7);
-    HAL_GPIO_DeInit(GPIOB, GPIO_PIN_0);
+
+    /*
+     * Vapautetaan tähän kerrokseen kuuluvat ADC-pinnit.
+     */
+    HAL_GPIO_DeInit(GPIOA, GPIO_PIN_7); /* VDIVS ADC */
+    HAL_GPIO_DeInit(GPIOB, GPIO_PIN_0); /* KELVIN ADC */
 
     return HAL_OK;
 }
